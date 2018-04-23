@@ -1,0 +1,352 @@
+---
+title: "01-model"
+author: "Ryan Wesslen"
+date: "April 22, 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+## Pre-processing
+
+Let's load the datasets.
+
+```{r data}
+library(tidyverse)
+
+user_stats <- read_csv("./data/user-stats.csv") %>%
+  filter(Valid == "Yes") %>%
+  mutate(screen_name = tolower(`twitter account`)) %>%
+  select(screen_name, LABEL) %>% #remove userlevel, e.g., followersCount, favoritesCount, friendsCount 
+  mutate_if(is.numeric, log) 
+
+t <- read_csv("./data/full-tweets-14days.csv") %>%
+  mutate(Date = format(created_at, tz="America/New_York"),
+         text = iconv(text, to="UTF-8"),
+         screen_name = tolower(screen_name),
+         DateFlag = case_when(
+           Date < "2017-05-30" ~ "Train",
+         TRUE ~ "Test"
+         )) %>%
+  inner_join(user_stats, by = "screen_name")
+
+count <- count(t, screen_name, sort = TRUE)
+
+# remove accounts with less than 40 tweets through the 2 weeks
+t <- filter(t, !(screen_name %in% count$screen_name[count$n < 40]))
+```
+
+## Text Features
+
+```{r}
+library(textfeatures)
+
+## standardize function
+scale_standard <- function(x) (x - 0) / (max(x, na.rm = TRUE) - 0)
+
+## convert to long (tidy) form and plot
+p <- group_by(t, screen_name, DateFlag) %>%
+  textfeatures() %>%
+  inner_join(user_stats, by = "screen_name") %>%
+  ungroup()
+  #%>%  mutate_if(is.numeric, scale_standard) 
+```
+
+```{r warning=FALSE, message=FALSE}
+table(p$LABEL)
+
+p <- p %>% 
+  mutate(y = case_when(LABEL == "realnews" ~ 1L,
+                        TRUE ~ 0L)) %>%
+  mutate(y = as.factor(y)) %>%
+  select(-LABEL)
+```
+
+
+## Lime & Caret
+
+```{r}
+# Split up the data set
+set.seed(3456)
+
+train <- filter(p, DateFlag == "Train") %>% select(-screen_name, -DateFlag)
+test <- filter(p, DateFlag == "Test") %>% select(-screen_name, -DateFlag)
+
+model <- randomForest::randomForest(y ~ ., data = train, xtest = test[,-18], ytest = test$y, localImp = TRUE)
+
+model
+```
+
+
+### Random Forest Explainer
+
+<https://mi2datalab.github.io/randomForestExplainer/>
+
+```{r}
+library(randomForestExplainer)
+
+# rerun without test for rfForest
+model <- randomForest::randomForest(y ~ ., data = train, localImp = TRUE)
+```
+
+#### Min Depth
+
+```{r}
+min_depth_frame <- min_depth_distribution(model)
+plot_min_depth_distribution(min_depth_frame)
+```
+
+#### Var Importance
+
+```{r}
+importance_frame <- measure_importance(model)
+
+knitr::kable(importance_frame)
+```
+
+```{r}
+importance_frame %>%
+  mutate(variable = as.factor(variable)) %>%
+  ggplot(aes(x = forcats::fct_reorder(variable, accuracy_decrease), y = accuracy_decrease)) +
+  geom_col() + 
+  coord_flip() +
+  labs(title = "Feature Importance: Decrease in Accuracy",
+       x = "Decrease in Accuracy after Removing Feature",
+       y = "Feature")
+```
+
+### Variables
+
+```{r}
+top9 <- importance_frame %>%
+  arrange(desc(accuracy_decrease)) %>%
+  head(n=9) %>%
+  select(variable) %>%
+  mutate(variable = as.character(variable))
+
+train %>%
+  select(c(top9$variable, "y")) %>%
+  gather(metric, value, -y) %>%
+  mutate(Type = ifelse(y==1L,"Real News","Suspicious")) %>%
+  ggplot(aes(x = value, fill = Type)) +
+    geom_density(alpha = 0.4) +
+    facet_wrap(~metric, scales = "free")
+```
+
+### Explore Examples
+
+```{r}
+z <- p %>%
+  filter(DateFlag == "Train") %>%
+  select(screen_name, n_capsp, n_exclaims, y) %>%
+  mutate(Type = ifelse(y==1L, "Real News","Suspicious")) %>%
+  ggplot(aes(x = n_capsp, y = n_exclaims, color = Type, text = screen_name)) +
+  geom_point() +
+  labs(x = "Percent of Characters with CAPS",
+       y = "")
+
+plotly::ggplotly(z, tooltip = c("x","y","text"))
+```
+
+#### Top 3 Caps Accounts
+
+```{r}
+filter(t, screen_name %in% c("govtslaves","aff_patriots", "henrymakow")) %>%
+  select(text, screen_name) %>%
+  split(.$screen_name) %>%
+  head(n=10) 
+```
+
+#### Top 3 Exclamation Accts
+
+```{r}
+filter(t, screen_name %in% c("unhealthytruth","100percfedup", "twitchyteam")) %>%
+  select(text, screen_name) %>%
+  filter(grepl('!', text)) %>% # keep only those with !'s
+  split(.$screen_name) %>%
+  select(text) %>%
+  head(n=10) 
+```
+
+### Explainer
+
+```{r}
+# library(lime); library(caret)
+# trainIndex <- createDataPartition(p$y, p = .8,
+#                                  list = FALSE,
+#                                  times = 1)
+# 
+# x_train <- p[trainIndex,] %>% select(-y, -screen_name)
+# x_test <- p[-trainIndex,] %>% select(-y, -screen_name)
+# 
+# y_train <- p$y[trainIndex]
+# y_test <- p$y[-trainIndex]
+# 
+# # Create Random Forest model on iris data
+# model <- train(x_train, y_train, method = 'rf', localImp = TRUE)
+# 
+# train <- p[trainIndex,] %>% select(-screen_name)
+# test <- p[-trainIndex,] %>% select(-screen_name)
+# # Create an explainer object
+# explainer <- lime(x_train, model)
+# 
+# # Explain new observation
+# explanation <- explain(x_test, explainer, n_labels = 1, n_features = 2)
+# 
+# plot_features(explanation)
+```
+
+### Index
+
+```{r eval=FALSE}
+n_chars = n_charS(text2),
+n_commas = n_commas(text2),
+n_digits = n_digits(text2),
+n_exclaims = n_exclaims(text2),
+n_extraspaces = n_extraspaces(text2),
+n_hashtags = n_hashtags(text),
+n_lowers = n_lowers(text2),
+n_lowersp = (n_lowers + 1L) / (n_chars + 1L),
+n_mentions = n_mentions(text),
+n_periods = n_periods(text2),
+n_urls = n_urls(text),
+n_words = n_words(text2),
+n_caps = n_caps(text2),
+n_nonasciis = n_nonasciis(text2),
+n_puncts = n_puncts(text2),
+n_capsp = (n_caps + 1L) / (n_chars + 1L),
+n_charsperword = (n_chars + 1L) / (n_words + 1L)
+```
+
+```{r eval=FALSE}
+n_words <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  x <- gsub("\\d", "", x)
+  x <- strsplit(x, "\\s+")
+  x <- lengths(x)
+  x[na] <- NA_integer_
+  x
+}
+
+n_charS <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  x <- gsub("\\s", "", x)
+  x <- nchar(x)
+  x[na] <- NA_integer_
+  x
+}
+
+n_digits <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  x <- nchar(gsub("\\D", "", x))
+  x[na] <- NA_integer_
+  x
+}
+
+n_hashtags <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  m <- gregexpr("#\\S+", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_mentions <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  m <- gregexpr("@\\S+", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_commas <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  m <- gregexpr(",+", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_periods <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  m <- gregexpr("\\.+", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_exclaims <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  m <- gregexpr("\\!+", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_extraspaces <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  m <- gregexpr("\\s{2,}|\\t|\\n", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_caps <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  m <- gregexpr("[[:upper:]]", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_lowers <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  m <- gregexpr("[[:lower:]]", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_urls <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  m <- gregexpr("https?:", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_nonasciis <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  x <- iconv(x, from = "UTF-8", to = "ASCII", sub = "[NONASCII]")
+  m <- gregexpr("\\[NONASCII\\]", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+
+n_puncts <- function(x) {
+  na <- is.na(x)
+  if (all(na)) return(0)
+  x <- gsub("!|\\.|\\,", "", x)
+  m <- gregexpr("[[:punct:]]", x)
+  x <- vply_int(m, ~ sum(. > 0, na.rm = TRUE))
+  x[na] <- NA_integer_
+  x
+}
+```
+
